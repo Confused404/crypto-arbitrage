@@ -58,10 +58,23 @@ That’s why infrastructure and fee structure often matter more than spotting th
 
 import asyncio, json, time, math
 import websockets
+from dotenv import load_dotenv
+from fees import FeeCache
 
-# config
-FEE_BP = 10 #10 bps per side (0.10%)
-FEE = FEE_BP / 10_000.0
+load_dotenv()
+fee_cache = FeeCache(ttl_seconds=3600)
+# cache current fee dicts so we don't fetch every tick
+_current_fees = {
+    "kraken":   None,  # {"taker": float, "maker": float}
+    "coinbase": None,
+}
+_last_fee_refresh = 0.0
+_FEE_REFRESH_SECS  = 60.0   # check once per minute; FeeCache itself TTLs to 1h
+
+
+# old hardcoded fees
+# FEE_BP = 10 #10 bps per side (0.10%)
+# FEE = FEE_BP / 10_000.0
 
 PAIR_KRAKEN = "BTC/USD" #v1 uses XBT/USD and v2 uses BTC/USD
 PAIR_COINBASE  = "BTC-USD" #Coinbase product id
@@ -76,9 +89,19 @@ def ts():
 def dbg(label, *args):
     print(f"[{ts()}] [{label}]", *args, flush=True)
 
-def net_spread_buyA_sellB(askA, bidB):
-    buy_cost = askA * (1 + FEE)
-    sell_recv = bidB * (1 - FEE)
+#old hardcodeed  net_spread
+# def net_spread_buyA_sellB(askA, bidB):
+#     buy_cost = askA * (1 + FEE)
+#     sell_recv = bidB * (1 - FEE)
+#     return sell_recv - buy_cost
+
+def net_spread_buyA_sellB(askA, taker_fee_A, bidB, taker_fee_B):
+    """
+    Net P&L perBTC when buying at A's ask (paying A's taker fee)
+    and selling at B's bod (paying B's taker fee).
+    """
+    buy_cost = askA * (1 + taker_fee_A)
+    sell_recv = bidB * (1 - taker_fee_B)
     return sell_recv - buy_cost
 
 async def kraken_loop():
@@ -231,12 +254,39 @@ async def coinbase_loop():
         dbg("COINBASE", f"reconnecting in {delay}s …")
         await asyncio.sleep(delay)
         
+async def ensure_fees():
+    """
+    Refresh fees at most once per _Fee_REFRESH_SECS (cheap check).
+    The feeCache inside does the heavy lifting (1h TTL by default)
+    """
+    global _last_fee_refresh, _current_fees
+    now = time.time()
+    if now - _last_fee_refresh < _FEE_REFRESH_SECS:
+        return 
+    
+    try:
+        kr = await fee_cache.get_fees("kraken", PAIR_KRAKEN)
+        cb = await fee_cache.get_fees("coinbase", PAIR_COINBASE)
+        first = (_current_fees["kraken"]) is None or (_current_fees["coinbase"] is None)
+        changed = (kr != _current_fees["kraken"]) or (cb != _current_fees["coinbase"])
+
+        _current_fees["kraken"] = kr
+        _current_fees["coinbase"] = cb
+        _last_fee_refresh = now
+
+        if first or changed:
+            dbg("FEES",
+                f"KRAKEN taker={kr['taker']:.4%} maker={kr['maker']:.4%} |"
+                f"CB taker={cb['taker']:.4%} maker={cb['maker']:.4%}")
+    except Exception as e:
+        dbg("FEES_WARN", f"fee refresh failed: {e}")
 
 async def reporter_loop():
     last_warn_missing = 0.0
     last_warn_stale   = 0.0
     last_hb           = 0.0
     STALE_SECS = 5.0
+    PROFIT_ALERT = 0.0  # raise this to $5/$10 when you want fewer alerts
 
     while True:
         k = state["kraken"]
@@ -249,11 +299,14 @@ async def reporter_loop():
                 f"KRAKEN conn={k['connected']} msgs={k['msgs']} "
                 f"COINBASE conn={c['connected']} msgs={c['msgs']}")
 
+        await ensure_fees()
+
         # warn if missing either TOB
         have_all = all(v is not None for v in (k["bid"], k["ask"], c["bid"], c["ask"]))
         if not have_all and time.time() - last_warn_missing > 3:
             dbg("WARN", "waiting for both TOBs …",
-                f"kraken_bid={k['bid']} kraken_ask={k['ask']} coinbase_bid={c['bid']} coinbase_ask={c['ask']}")
+                f"kraken_bid={k['bid']} kraken_ask={k['ask']} "
+                f"coinbase_bid={c['bid']} coinbase_ask={c['ask']}")            
             last_warn_missing = time.time()
 
         # warn if stale
@@ -264,10 +317,15 @@ async def reporter_loop():
                 dbg("STALE", f"{name} TOB stale: {now - last_ts:.1f}s without update")
                 last_warn_stale = now
 
-        if have_all:
-            a_to_b = net_spread_buyA_sellB(k["ask"], c["bid"])  # buy Kraken ask, sell Coinbase bid
-            b_to_a = net_spread_buyA_sellB(c["ask"], k["bid"])  # buy Coinbase ask, sell Kraken bid
-            PROFIT_ALERT = 0.0  # you can set this to something higher like 5.0 or 10.0
+        if have_all and _current_fees["kraken"] and _current_fees["coinbase"]:
+            kf = _current_fees["kraken"]["taker"]
+            cbf = _current_fees["coinbase"]["taker"]
+
+            # buy Kraken ask, sell Coinbase bid
+            a_to_b = net_spread_buyA_sellB(k["ask"], kf, c["bid"], cbf)  # buy Kraken ask, sell Coinbase bid
+            # buy Coinbase ask, sell Kraken bid
+            b_to_a = net_spread_buyA_sellB(c["ask"], cbf, k["bid"], kf)  # buy Coinbase ask, sell Kraken bid
+            
             if a_to_b > PROFIT_ALERT:
                 dbg("ALERT 🚀", f"Profitable K->CB trade found! Net profit = ${a_to_b:.2f} per BTC "
                                 f"(buy {k['ask']:.2f} sell {c['bid']:.2f})")
@@ -283,8 +341,7 @@ async def reporter_loop():
 
 
 async def main():
-    dbg("BOOT", f"starting with FEE_BP={FEE_BP} ({FEE*100:.3f}%) "
-               f"pairs: kraken={PAIR_KRAKEN}, coinbase={PAIR_COINBASE}")
+    dbg("BOOT", f"starting with pairs: kraken={PAIR_KRAKEN}, coinbase={PAIR_COINBASE}")
     await asyncio.gather(kraken_loop(), coinbase_loop(), reporter_loop())
 
 if __name__ == "__main__":
